@@ -133,7 +133,14 @@ defmodule Pandex.OIDC do
     end
   end
 
-  # Stub — replace with actual KMS retrieval in production.
+  defp load_private_key(%{private_key_ref: "local-jwk:" <> encoded_jwk}) do
+    case Jason.decode(encoded_jwk) do
+      {:ok, jwk} -> {:ok, JOSE.JWK.from_map(jwk)}
+      {:error, reason} -> {:error, {:invalid_private_key_ref, reason}}
+    end
+  end
+
+  # Replace this branch with KMS retrieval before production key material leaves the app DB.
   defp load_private_key(%{private_key_ref: ref}) when is_binary(ref) do
     {:error, {:kms_not_configured, ref}}
   end

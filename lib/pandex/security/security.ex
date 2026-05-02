@@ -49,6 +49,13 @@ defmodule Pandex.Security do
     |> tap(fn _ -> KeyCache.invalidate() end)
   end
 
+  def ensure_active_signing_key(algorithm \\ "RS256") do
+    case get_active_signing_key() do
+      {:ok, key} -> {:ok, key}
+      {:error, :no_active_signing_key} -> rotate_signing_key(algorithm)
+    end
+  end
+
   # ── Private ───────────────────────────────────────────────────────────────────
 
   import Ecto.Query
@@ -65,20 +72,24 @@ defmodule Pandex.Security do
 
   defp generate_and_insert_key("RS256") do
     # Generate RSA-2048 key pair via JOSE
-    {_private_jwk, public_jwk} = JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_map()
+    {_public_jwk, private_jwk} = JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_map()
     kid = :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
 
     attrs = %{
       kid: kid,
       algorithm: "RS256",
       status: "active",
-      public_key: public_jwk
-      # private_key_ref stored encrypted separately (KMS / secrets manager)
+      public_key: Map.take(private_jwk, ["kty", "n", "e"]),
+      private_key_ref: encode_local_private_key(private_jwk)
     }
 
     %SigningKey{}
     |> SigningKey.changeset(attrs)
     |> Repo.insert()
+  end
+
+  defp encode_local_private_key(private_jwk) do
+    "local-jwk:" <> Jason.encode!(private_jwk)
   end
 
   defp load_and_cache_active_key do

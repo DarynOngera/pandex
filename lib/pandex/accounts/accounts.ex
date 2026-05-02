@@ -10,8 +10,6 @@ defmodule Pandex.Accounts do
   alias Pandex.Repo
   alias Pandex.Accounts.User
 
-  # ── Queries ───────────────────────────────────────────────────────────────────
-
   def get_user!(id), do: Repo.get!(User, id)
 
   def get_user_by_email(email) when is_binary(email) do
@@ -36,8 +34,6 @@ defmodule Pandex.Accounts do
       user -> {:ok, user}
     end
   end
-
-  # ── Mutations ─────────────────────────────────────────────────────────────────
 
   def create_user(attrs \\ %{}) do
     %User{}

@@ -43,6 +43,7 @@ defmodule Pandex.OAuth.AuthorizationCode do
       :tenant_id,
       :client_id,
       :code_hash,
+      :redirect_uri,
       :code_challenge,
       :expires_at
     ])

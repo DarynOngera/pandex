@@ -10,11 +10,13 @@ defmodule Pandex.OAuth do
     - Refresh token reuse detection triggers full family revocation.
   """
   import Ecto.Query
+  alias Pandex.Accounts.User
   alias Pandex.Repo
   alias Pandex.OAuth.{Client, AuthorizationCode, AccessToken, RefreshToken}
 
   # ── Clients ───────────────────────────────────────────────────────────────────
 
+  def get_client(id), do: Repo.get(Client, id)
   def get_client!(id), do: Repo.get!(Client, id)
 
   def get_client_for_tenant!(client_id, tenant_id) do
@@ -33,9 +35,23 @@ defmodule Pandex.OAuth do
     |> Repo.update()
   end
 
+  def authenticate_client(%Client{client_type: "public"}, _secret), do: :ok
+
+  def authenticate_client(%Client{client_type: "confidential", client_secret_hash: hash}, secret)
+      when is_binary(hash) and is_binary(secret) do
+    if Bcrypt.verify_pass(secret, hash), do: :ok, else: {:error, :invalid_client}
+  end
+
+  def authenticate_client(%Client{client_type: "confidential"}, _secret),
+    do: {:error, :invalid_client}
+
   @doc "Validate that a redirect URI is registered for this client (exact match)."
   def validate_redirect_uri(%Client{redirect_uris: uris}, uri) do
     if uri in uris, do: :ok, else: {:error, :invalid_redirect_uri}
+  end
+
+  def validate_scopes(%Client{allowed_scopes: allowed_scopes}, scopes) do
+    if Enum.all?(scopes, &(&1 in allowed_scopes)), do: :ok, else: {:error, :invalid_scope}
   end
 
   # ── Authorization Codes ───────────────────────────────────────────────────────
@@ -64,21 +80,29 @@ defmodule Pandex.OAuth do
   Validates PKCE code_verifier against stored code_challenge.
   Returns `{:ok, authorization_code}` or `{:error, reason}`.
   """
-  def exchange_authorization_code(raw_code, code_verifier, client_id) do
+  def exchange_authorization_code(raw_code, code_verifier, client_id, redirect_uri \\ nil) do
     code_hash = hash_token(raw_code)
     now = DateTime.utc_now()
 
     Repo.transaction(fn ->
-      code =
-        AuthorizationCode
-        |> where(
+      query =
+        where(
+          AuthorizationCode,
           [c],
           c.code_hash == ^code_hash and
             c.client_id == ^client_id and
             is_nil(c.used_at) and
             c.expires_at > ^now
         )
-        |> Repo.one()
+
+      query =
+        if is_binary(redirect_uri) and redirect_uri != "" do
+          where(query, [c], c.redirect_uri == ^redirect_uri)
+        else
+          query
+        end
+
+      code = Repo.one(query)
 
       with %AuthorizationCode{} = c <- code || Repo.rollback(:invalid_code),
            :ok <- verify_pkce(code_verifier, c.code_challenge, c.code_challenge_method) do
@@ -138,12 +162,17 @@ defmodule Pandex.OAuth do
     token_hash = hash_token(raw_token)
     family_id = attrs[:family_id] || Ecto.UUID.generate()
 
+    expires_at =
+      attrs[:expires_at] ||
+        DateTime.utc_now() |> DateTime.add(30 * 86_400, :second) |> DateTime.truncate(:second)
+
     with {:ok, token} <-
            %RefreshToken{}
            |> RefreshToken.changeset(
              Map.merge(attrs, %{
                token_hash: token_hash,
-               family_id: family_id
+               family_id: family_id,
+               expires_at: expires_at
              })
            )
            |> Repo.insert() do
@@ -161,15 +190,23 @@ defmodule Pandex.OAuth do
 
   All steps execute in a single serialisable transaction.
   """
-  def rotate_refresh_token(raw_token) do
+  def rotate_refresh_token(raw_token, client_id \\ nil) do
     token_hash = hash_token(raw_token)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     Repo.transaction(fn ->
-      token =
+      query =
         RefreshToken
         |> where([t], t.token_hash == ^token_hash)
-        |> Repo.one()
+
+      query =
+        if is_binary(client_id) and client_id != "" do
+          where(query, [t], t.client_id == ^client_id)
+        else
+          query
+        end
+
+      token = Repo.one(query)
 
       cond do
         is_nil(token) ->
@@ -193,17 +230,80 @@ defmodule Pandex.OAuth do
             |> Ecto.Changeset.change(used_at: now)
             |> Repo.update()
 
-          # Issue successor in same family
-          issue_refresh_token(%{
-            user_id: token.user_id,
-            tenant_id: token.tenant_id,
-            client_id: token.client_id,
-            scopes: token.scopes,
-            family_id: token.family_id,
-            rotated_from: token.id
-          })
+          case issue_refresh_token(%{
+                 user_id: token.user_id,
+                 tenant_id: token.tenant_id,
+                 client_id: token.client_id,
+                 scopes: token.scopes,
+                 family_id: token.family_id,
+                 rotated_from_id: token.id
+               }) do
+            {:ok, successor} -> successor
+            {:error, changeset} -> Repo.rollback(changeset)
+          end
       end
     end)
+  end
+
+  def revoke_access_token(raw_token) do
+    token_hash = hash_token(raw_token)
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    {count, _} =
+      AccessToken
+      |> where([t], t.token_hash == ^token_hash and is_nil(t.revoked_at))
+      |> Repo.update_all(set: [revoked_at: now])
+
+    {:ok, count}
+  end
+
+  def revoke_refresh_token(raw_token) do
+    token_hash = hash_token(raw_token)
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    {count, _} =
+      RefreshToken
+      |> where([t], t.token_hash == ^token_hash and is_nil(t.revoked_at))
+      |> Repo.update_all(set: [revoked_at: now])
+
+    {:ok, count}
+  end
+
+  def introspect(raw_token) do
+    token_hash = hash_token(raw_token)
+    now = DateTime.utc_now()
+
+    token =
+      AccessToken
+      |> where([t], t.token_hash == ^token_hash and is_nil(t.revoked_at) and t.expires_at > ^now)
+      |> Repo.one()
+
+    case token do
+      nil ->
+        %{active: false}
+
+      %AccessToken{} = token ->
+        %{
+          active: true,
+          sub: token.user_id,
+          client_id: token.client_id,
+          tenant_id: token.tenant_id,
+          scope: Enum.join(token.scopes, " "),
+          exp: DateTime.to_unix(token.expires_at),
+          token_type: "Bearer"
+        }
+    end
+  end
+
+  def userinfo(raw_token) do
+    case introspect_access_token(raw_token) do
+      nil ->
+        {:error, :invalid_token}
+
+      %AccessToken{} = token ->
+        user = Repo.get!(User, token.user_id)
+        {:ok, Pandex.OIDC.build_userinfo(user, token.scopes)}
+    end
   end
 
   defp revoke_token_family!(family_id, now) do

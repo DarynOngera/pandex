@@ -41,7 +41,7 @@ defmodule Pandex.OAuth.RefreshToken do
       :scopes,
       :expires_at
     ])
-    |> validate_required([:user_id, :tenant_id, :client_id, :token_hash, :family_id])
+    |> validate_required([:user_id, :tenant_id, :client_id, :token_hash, :family_id, :expires_at])
     |> unique_constraint(:token_hash)
   end
 end
