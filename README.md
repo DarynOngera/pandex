@@ -48,6 +48,9 @@ Open http://localhost:4000 in your browser.
 If your local Postgres user or password is different, update `config/dev.exs`
 before running `mix ecto.setup`.
 
+For endpoint flow examples and curl payloads, see [APIDOCS.md](APIDOCS.md).
+For technical architecture and onboarding, see [SYSTEM_FLOW.md](SYSTEM_FLOW.md).
+
 ---
 
 ## Context architecture
