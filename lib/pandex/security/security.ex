@@ -5,7 +5,11 @@ defmodule Pandex.Security do
   The active signing key is used for new ID Token signatures.
   The previous key is kept in JWKS for a grace period so relying parties
   can verify tokens signed before rotation.
+
+  `signing_key_rotated` audit events are emitted inside the same transaction
+  as the rotation so they cannot be silently dropped.
   """
+  alias Pandex.Audit
   alias Pandex.Repo
   alias Pandex.Security.{SigningKey, KeyCache}
 
@@ -35,18 +39,35 @@ defmodule Pandex.Security do
   1. Demote current active key → previous.
   2. Mark any existing previous key → retired.
   3. Generate a fresh key pair → active.
-  4. Invalidate ETS cache (PubSub broadcast).
+  4. Emit `signing_key_rotated` audit event.
+  5. Invalidate ETS cache.
   """
   def rotate_signing_key(algorithm \\ "RS256") do
-    Repo.transaction(fn ->
-      # Demote active → previous
-      from_active_to_previous()
+    result =
+      Repo.transaction(fn ->
+        from_active_to_previous()
 
-      # Generate and persist new key
-      {:ok, new_key} = generate_and_insert_key(algorithm)
-      new_key
-    end)
-    |> tap(fn _ -> KeyCache.invalidate() end)
+        with {:ok, new_key} <- generate_and_insert_key(algorithm),
+             {:ok, _} <-
+               Audit.log(
+                 # Signing keys are global (not tenant-scoped). We use a sentinel
+                 # value here so the audit schema constraint is satisfied while
+                 # making it clear this is a system-level event.
+                 "00000000-0000-0000-0000-000000000000",
+                 "signing_key_rotated",
+                 %{
+                   target_id: new_key.id,
+                   target_type: "signing_key",
+                   metadata: %{"kid" => new_key.kid, "algorithm" => new_key.algorithm}
+                 }
+               ) do
+          new_key
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+
+    tap(result, fn _ -> KeyCache.invalidate() end)
   end
 
   def ensure_active_signing_key(algorithm \\ "RS256") do
@@ -71,7 +92,6 @@ defmodule Pandex.Security do
   end
 
   defp generate_and_insert_key("RS256") do
-    # Generate RSA-2048 key pair via JOSE
     {_public_jwk, private_jwk} = JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_map()
     kid = :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
 

@@ -4,8 +4,12 @@ defmodule Pandex.Sessions do
   (magic links / OTP codes).
 
   Raw challenge codes are NEVER stored; only their BLAKE2b hash is persisted.
+
+  Audit events are emitted for every security-sensitive mutation and are
+  written inside the same transaction as the mutation they describe.
   """
   import Ecto.Query
+  alias Pandex.Audit
   alias Pandex.Repo
   alias Pandex.Sessions.{Session, LoginChallenge}
 
@@ -18,7 +22,7 @@ defmodule Pandex.Sessions do
     |> Repo.insert()
   end
 
-  @doc "Fetch a valid (non-expired) session by id."
+  @doc "Fetch a valid (non-expired, non-revoked) session by id."
   def get_valid_session(id) do
     now = DateTime.utc_now()
 
@@ -29,21 +33,47 @@ defmodule Pandex.Sessions do
 
   @doc "Revoke a session immediately (logout)."
   def revoke_session(%Session{} = session) do
-    session
-    |> Ecto.Changeset.change(revoked_at: DateTime.utc_now() |> DateTime.truncate(:second))
-    |> Repo.update()
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    Repo.transaction(fn ->
+      {:ok, revoked} =
+        session
+        |> Ecto.Changeset.change(revoked_at: now)
+        |> Repo.update()
+
+      {:ok, _} =
+        Audit.log(session.tenant_id, "logout", %{
+          actor_id: session.user_id,
+          target_id: session.id,
+          target_type: "session"
+        })
+
+      revoked
+    end)
   end
 
   @doc "Revoke all sessions for a user in a tenant (e.g. password change)."
   def revoke_all_sessions(user_id, tenant_id) do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
-    {count, _} =
-      Session
-      |> where([s], s.user_id == ^user_id and s.tenant_id == ^tenant_id and is_nil(s.revoked_at))
-      |> Repo.update_all(set: [revoked_at: now])
+    Repo.transaction(fn ->
+      {count, _} =
+        Session
+        |> where([s], s.user_id == ^user_id and s.tenant_id == ^tenant_id and is_nil(s.revoked_at))
+        |> Repo.update_all(set: [revoked_at: now])
 
-    {:ok, count}
+      {:ok, _} =
+        Audit.log(tenant_id, "session_revoked", %{
+          actor_id: user_id,
+          metadata: %{"revoked_count" => count, "reason" => "revoke_all"}
+        })
+
+      {:ok, count}
+    end)
+    |> case do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   # ── Login Challenges ──────────────────────────────────────────────────────────
@@ -67,7 +97,8 @@ defmodule Pandex.Sessions do
       expires_at: expires_at
     }
 
-    with {:ok, challenge} <- %LoginChallenge{} |> LoginChallenge.changeset(attrs) |> Repo.insert() do
+    with {:ok, challenge} <-
+           %LoginChallenge{} |> LoginChallenge.changeset(attrs) |> Repo.insert() do
       {:ok, {raw_code, challenge}}
     end
   end
@@ -75,7 +106,8 @@ defmodule Pandex.Sessions do
   @doc """
   Verify and consume a login challenge.
 
-  Returns `{:ok, challenge}` on success, or `{:error, reason}`.
+  Emits `login_success` on success and `login_failed` on every failure.
+  Returns `{:ok, challenge}` or `{:error, reason}`.
   Consumed challenges are marked immediately — replay attacks are blocked.
   """
   def verify_and_consume_challenge(raw_code, tenant_id) do
@@ -96,6 +128,12 @@ defmodule Pandex.Sessions do
 
       case challenge do
         nil ->
+          # Emit login_failed without an actor_id — we don't know who attempted it.
+          {:ok, _} =
+            Audit.log(tenant_id, "login_failed", %{
+              metadata: %{"reason" => "invalid_or_expired_challenge"}
+            })
+
           Repo.rollback(:invalid_or_expired)
 
         ch ->
@@ -103,6 +141,13 @@ defmodule Pandex.Sessions do
             ch
             |> Ecto.Changeset.change(consumed_at: DateTime.truncate(now, :second))
             |> Repo.update()
+
+          {:ok, _} =
+            Audit.log(tenant_id, "login_success", %{
+              actor_id: ch.user_id,
+              target_id: ch.id,
+              target_type: "login_challenge"
+            })
 
           consumed
       end

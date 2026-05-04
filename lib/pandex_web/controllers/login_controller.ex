@@ -1,12 +1,23 @@
 defmodule PandexWeb.LoginController do
   use PandexWeb, :controller
 
-  alias Pandex.{Accounts, Sessions}
+  require Logger
+
+  alias Pandex.{Accounts, Emails.LoginEmail, Mailer, Sessions}
+  alias PandexWeb.Plugs.RateLimit
+
+  # 10 challenge requests per IP per minute — tight because this is the
+  # primary user-enumeration and spam surface.
+  plug RateLimit, bucket: "login_challenge", limit: 10, window_ms: 60_000
+  # Consume is per-IP, slightly looser — covers retries from a single session.
+  plug RateLimit, bucket: "login_consume", limit: 20, window_ms: 60_000
 
   def create_challenge(conn, %{"tenant_id" => tenant_id, "email" => email} = params) do
     with {:ok, type} <- challenge_type(Map.get(params, "type", "magic_link")),
          {:ok, user} <- Accounts.get_user_for_tenant(email, tenant_id),
          {:ok, {raw_code, challenge}} <- Sessions.create_login_challenge(user.id, tenant_id, type) do
+      deliver_challenge_email(type, user.email, tenant_id, raw_code)
+
       body = %{
         challenge_id: challenge.id,
         tenant_id: challenge.tenant_id,
@@ -26,7 +37,11 @@ defmodule PandexWeb.LoginController do
       |> json(body)
     else
       {:error, :not_found} ->
-        oauth_error(conn, :not_found, "user not found for tenant")
+        # Return the same shape as success to avoid user enumeration.
+        # The client cannot distinguish "user not found" from "email sent".
+        conn
+        |> put_status(:created)
+        |> json(%{status: "challenge_issued"})
 
       {:error, :unsupported_challenge_type} ->
         oauth_error(conn, :bad_request, "unsupported challenge type")
@@ -65,6 +80,40 @@ defmodule PandexWeb.LoginController do
 
   def consume_challenge(conn, _params),
     do: oauth_error(conn, :bad_request, "tenant_id and code are required")
+
+  # ── Private ───────────────────────────────────────────────────────────────────
+
+  # Deliver email and swallow delivery errors — the challenge DB record is
+  # already committed. Log failures so ops can investigate without blocking
+  # the caller. A production setup would use a job queue (Oban etc.) here.
+  defp deliver_challenge_email(:magic_link, to_email, tenant_id, raw_code) do
+    email = LoginEmail.magic_link(to_email, tenant_id, raw_code)
+
+    case Mailer.deliver(email) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Failed to deliver magic link email to #{to_email}: #{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp deliver_challenge_email(:otp, to_email, _tenant_id, raw_code) do
+    email = LoginEmail.otp(to_email, raw_code)
+
+    case Mailer.deliver(email) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Failed to deliver OTP email to #{to_email}: #{inspect(reason)}")
+        :ok
+    end
+  end
+
+  # Passkey challenges don't use email delivery.
+  defp deliver_challenge_email(:passkey, _to_email, _tenant_id, _raw_code), do: :ok
 
   defp challenge_type("magic_link"), do: {:ok, :magic_link}
   defp challenge_type("otp"), do: {:ok, :otp}

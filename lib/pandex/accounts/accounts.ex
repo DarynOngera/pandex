@@ -5,10 +5,18 @@ defmodule Pandex.Accounts do
   Users exist globally; their membership in a Tenant is tracked via
   Pandex.Tenancy.Membership. This separation keeps the user pool
   clean and avoids duplicate records when a user joins multiple tenants.
+
+  Audit events are emitted inside the same transaction as the mutation.
+  Because users are global (no tenant_id), audit events for user mutations
+  use the sentinel tenant_id "00000000-0000-0000-0000-000000000000" to
+  satisfy the schema constraint while making the scope clear.
   """
   import Ecto.Query
+  alias Pandex.Audit
   alias Pandex.Repo
   alias Pandex.Accounts.User
+
+  @system_tenant_id "00000000-0000-0000-0000-000000000000"
 
   def get_user!(id), do: Repo.get!(User, id)
 
@@ -36,9 +44,23 @@ defmodule Pandex.Accounts do
   end
 
   def create_user(attrs \\ %{}) do
-    %User{}
-    |> User.registration_changeset(attrs)
-    |> Repo.insert()
+    Repo.transaction(fn ->
+      with {:ok, user} <-
+             %User{}
+             |> User.registration_changeset(attrs)
+             |> Repo.insert(),
+           {:ok, _} <-
+             Audit.log(@system_tenant_id, "user_created", %{
+               actor_id: user.id,
+               target_id: user.id,
+               target_type: "user",
+               metadata: %{"email" => user.email}
+             }) do
+        user
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
   end
 
   def update_user(%User{} = user, attrs) do
@@ -48,8 +70,20 @@ defmodule Pandex.Accounts do
   end
 
   def suspend_user(%User{} = user) do
-    user
-    |> Ecto.Changeset.change(status: "suspended")
-    |> Repo.update()
+    Repo.transaction(fn ->
+      with {:ok, suspended} <-
+             user
+             |> Ecto.Changeset.change(status: "suspended")
+             |> Repo.update(),
+           {:ok, _} <-
+             Audit.log(@system_tenant_id, "user_suspended", %{
+               target_id: user.id,
+               target_type: "user"
+             }) do
+        suspended
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
   end
 end

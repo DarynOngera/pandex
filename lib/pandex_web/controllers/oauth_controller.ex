@@ -1,14 +1,32 @@
 defmodule PandexWeb.OAuthController do
   use PandexWeb, :controller
 
-  alias Pandex.{Accounts, OAuth, Security, Sessions}
+  alias Pandex.{Accounts, OAuth, Security}
   alias Pandex.OAuth.Client
+  alias PandexWeb.Plugs.RateLimit
+
+  # Token endpoint: 60 requests/min per IP. This covers both authorization_code
+  # and refresh_token grants. Clients that rotate frequently will not be
+  # impacted; this targets brute-force and credential-stuffing patterns.
+  plug RateLimit, [bucket: "oauth_token", limit: 60, window_ms: 60_000] when action in [:token]
+
+  # Introspection is read-only but must be rate-limited to prevent
+  # token validity probing.
+  plug RateLimit,
+       [bucket: "oauth_introspect",
+       limit: 120,
+       window_ms: 60_000]
+       when action in [:introspect]
 
   def authorize(conn, params) do
+    # current_session is populated by SessionAuth plug on the :oauth_browser pipeline.
+    # The session_id query param is accepted as a fallback for API clients.
+    session = conn.assigns[:current_session]
+
     with :ok <- require_param(params, "client_id"),
          :ok <- require_param(params, "redirect_uri"),
          :ok <- require_param(params, "code_challenge"),
-         :ok <- require_param(params, "session_id"),
+         session when not is_nil(session) <- session || {:error, :no_session},
          :ok <- validate_response_type(params),
          %Client{} = client <- OAuth.get_client(params["client_id"]),
          :ok <- validate_active_client(client),
@@ -16,7 +34,6 @@ defmodule PandexWeb.OAuthController do
          scopes <- parse_scopes(params["scope"]),
          :ok <- OAuth.validate_scopes(client, scopes),
          :ok <- validate_code_challenge_method(params),
-         session when not is_nil(session) <- Sessions.get_valid_session(params["session_id"]),
          :ok <- validate_session_client_boundary(session, client),
          {:ok, {raw_code, _code}} <-
            OAuth.issue_authorization_code(%{
@@ -31,7 +48,8 @@ defmodule PandexWeb.OAuthController do
            }) do
       redirect(conn, external: redirect_uri(params["redirect_uri"], raw_code, params["state"]))
     else
-      nil -> oauth_error(conn, :unauthorized, "invalid session or client")
+      nil -> oauth_error(conn, :unauthorized, "invalid client")
+      {:error, :no_session} -> oauth_error(conn, :unauthorized, "authentication required")
       {:error, reason} -> handle_oauth_error(conn, reason)
     end
   end

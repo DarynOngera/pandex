@@ -4,8 +4,13 @@ defmodule Pandex.OIDC do
 
   This module composes claims from other contexts (Accounts, OAuth)
   and delegates all cryptographic operations to JOSE via the Security context.
+
+  Private key retrieval is delegated to `Pandex.Security.KeyProvider`, which
+  is configured per-environment. In dev/test this uses the Local adapter
+  (JWK stored in the DB). In production, configure a KMS-backed adapter.
   """
   alias Pandex.Security
+  alias Pandex.Security.KeyProvider
   alias Pandex.Accounts.User
   alias Pandex.OIDC.DiscoveryCache
 
@@ -120,9 +125,7 @@ defmodule Pandex.OIDC do
   # ── Private helpers ───────────────────────────────────────────────────────────
 
   defp sign_jwt(claims, signing_key) do
-    # In production, the private key material is retrieved from a KMS reference.
-    # Here we stub this as: load the JWK stored at signing_key.private_key_ref.
-    with {:ok, private_jwk} <- load_private_key(signing_key) do
+    with {:ok, private_jwk} <- KeyProvider.load(signing_key.private_key_ref) do
       jws = %{"alg" => signing_key.algorithm, "kid" => signing_key.kid}
 
       {_type, token} =
@@ -132,20 +135,6 @@ defmodule Pandex.OIDC do
       {:ok, token}
     end
   end
-
-  defp load_private_key(%{private_key_ref: "local-jwk:" <> encoded_jwk}) do
-    case Jason.decode(encoded_jwk) do
-      {:ok, jwk} -> {:ok, JOSE.JWK.from_map(jwk)}
-      {:error, reason} -> {:error, {:invalid_private_key_ref, reason}}
-    end
-  end
-
-  # Replace this branch with KMS retrieval before production key material leaves the app DB.
-  defp load_private_key(%{private_key_ref: ref}) when is_binary(ref) do
-    {:error, {:kms_not_configured, ref}}
-  end
-
-  defp load_private_key(_), do: {:error, :no_private_key}
 
   defp issuer_uri, do: Application.fetch_env!(:pandex, :oidc_issuer)
 
